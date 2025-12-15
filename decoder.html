@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RayNet GGWave Receiver</title>
+<style>
+  body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
+  pre { background: #000; padding: 10px; height: 300px; overflow-y: auto; }
+  button { margin-top: 10px; display: block; }
+</style>
+</head>
+<body>
+
+<h2>📡 RayNet GGWave Receiver</h2>
+
+<button id="startBtn">Start Listening</button>
+<button id="stopBtn" hidden>Stop Listening</button>
+<button id="downloadBtn" disabled>Download File</button>
+
+<pre id="log"></pre>
+
+<!-- GGWave JS -->
+<script src="https://ggwave-js.ggerganov.com/ggwave.js"></script>
+<!-- LZString -->
+<script src="https://cdn.jsdelivr.net/npm/lz-string@1.4.4/libs/lz-string.min.js"></script>
+
+<script>
+window.AudioContext = window.AudioContext || window.webkitAudioContext;
+
+const logEl = document.getElementById("log");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+const downloadBtn = document.getElementById("downloadBtn");
+
+function log(msg) {
+    logEl.textContent += msg + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+// GGWave vars
+let context = null;
+let ggwave = null;
+let instance = null;
+let parameters = null;
+let recorder = null;
+let mediaStream = null;
+
+// File reconstruction vars
+let receivedChunks = [];
+let totalChunks = 0;
+let fileType = null;
+let fileName = "received_file";
+
+// Convert typed arrays
+function convertTypedArray(src, type) {
+    const buffer = new ArrayBuffer(src.byteLength);
+    new src.constructor(buffer).set(src);
+    return new type(buffer);
+}
+
+// Initialize GGWave
+async function initGGWave() {
+    if (!context) {
+        context = new AudioContext({sampleRate:48000});
+        ggwave = await ggwave_factory();
+        parameters = ggwave.getDefaultParameters();
+        parameters.sampleRateInp = context.sampleRate;
+        parameters.sampleRateOut = context.sampleRate;
+        instance = ggwave.init(parameters);
+        log("GGWave initialized ✅");
+    }
+}
+
+// Start listening
+startBtn.onclick = async () => {
+    await initGGWave();
+    if (context.state === "suspended") await context.resume();
+
+    const constraints = { audio: { echoCancellation:false, autoGainControl:false, noiseSuppression:false } };
+    navigator.mediaDevices.getUserMedia(constraints).then((stream) => {
+        mediaStream = context.createMediaStreamSource(stream);
+        const bufferSize = 1024;
+        recorder = context.createScriptProcessor(bufferSize,1,1);
+        recorder.onaudioprocess = function(e) {
+            const source = e.inputBuffer;
+            const res = ggwave.decode(instance, convertTypedArray(new Float32Array(source.getChannelData(0)), Int8Array));
+            if (res && res.length > 0) {
+                const text = new TextDecoder("utf-8").decode(res);
+                log(`Received: ${text}`);
+                handlePacket(text);
+            }
+        };
+        mediaStream.connect(recorder);
+        recorder.connect(context.destination);
+    }).catch(console.error);
+
+    log("Listening...");
+    startBtn.hidden = true;
+    stopBtn.hidden = false;
+};
+
+// Stop listening
+stopBtn.onclick = () => {
+    if (recorder) {
+        recorder.disconnect(context.destination);
+        mediaStream.disconnect(recorder);
+        recorder = null;
+    }
+    log("Stopped listening");
+    startBtn.hidden = false;
+    stopBtn.hidden = true;
+};
+
+// Handle packets
+function handlePacket(packet) {
+    if(packet.startsWith("START|")) {
+        // parse metadata
+        const meta = {};
+        packet.split("|").slice(1).forEach(p => {
+            const [key, val] = p.split("=");
+            meta[key] = val;
+        });
+        fileType = meta.type;
+        fileName = meta.name || "received_file";
+        totalChunks = parseInt(meta.packets);
+        receivedChunks = new Array(totalChunks);
+        log(`START received: ${fileName}, expecting ${totalChunks} chunks`);
+    } else if(packet.startsWith("DATA|")) {
+        const parts = packet.split("|");
+        const idx = parseInt(parts[1]);
+        const data = parts[2];
+        receivedChunks[idx] = data;
+    } else if(packet === "END") {
+        log("END received. Reconstructing file...");
+        reconstructFile();
+    }
+}
+
+// Reconstruct file
+function reconstructFile() {
+    const combined = receivedChunks.join("");
+    let fileContent;
+
+    try {
+        if(fileType === "html") {
+            const decompressed = LZString.decompressFromBase64(combined);
+            if(!decompressed) throw new Error("Decompression failed");
+            fileContent = decompressed;
+        } else if(fileType === "img") {
+            // base64 image
+            const binary = atob(combined);
+            fileContent = new Uint8Array(binary.length);
+            for(let i=0; i<binary.length; i++) fileContent[i] = binary.charCodeAt(i);
+        } else {
+            throw new Error("Unknown file type");
+        }
+
+        downloadBtn.disabled = false;
+        downloadBtn.onclick = () => {
+            let blob;
+            if(fileType === "html") {
+                blob = new Blob([fileContent], {type:"text/html"});
+            } else {
+                blob = new Blob([fileContent]);
+            }
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = fileName;
+            a.click();
+            URL.revokeObjectURL(url);
+        };
+
+        log("File reconstructed. Click 'Download File' to save.");
+    } catch(e) {
+        log("Error reconstructing file: " + e.message);
+    }
+}
+</script>
+
+</body>
+</html>
